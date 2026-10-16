@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# A curl stand-in that is a tiny, stateful CoolerControl. Pointed at by
+# CARB_CURL. State lives as JSON files in $FAKE_CC; every request is appended
+# to $FAKE_CC/calls as "METHOD PATH BODY".
+#
+# Only the routes the engine uses exist, with the shapes coolercontrold 4.3.1
+# returns. A wrong route answers 404, as the real daemon does, so a typo in the
+# engine fails a test instead of passing quietly.
+set -uo pipefail
+
+S="${FAKE_CC:?FAKE_CC not set}"
+method=GET data="" url="" auth=""
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -X)     method="$2"; shift 2 ;;
+        --data) data="$2"; shift 2 ;;
+        -H)     [[ "$2" == Authorization:* ]] && auth="${2#Authorization: Bearer }"; shift 2 ;;
+        -w|--max-time) shift 2 ;;
+        -*)     shift ;;
+        *)      url="$1"; shift ;;
+    esac
+done
+path="/${url#*://*/}"
+printf '%s %s %s\n' "$method" "$path" "$data" >> "$S/calls"
+
+reply() { printf '%s\n%s' "$2" "$1"; exit 0; }
+[[ -f "$S/down" ]] && exit 7    # curl's "could not connect"
+
+[[ "$path" == /handshake ]] && reply 200 '{"shake":true}'
+[[ "$auth" == "$(cat "$S/token")" ]] || reply 401 '{"error":"Invalid Credentials"}'
+# A read-only token reads but may not write, as with the real daemon.
+if [[ -f "$S/readonly" && "$method" != GET && "$path" != /status ]]; then
+    reply 403 '{"error":"This token does not have write access."}'
+fi
+
+j() { jq -c "$@"; }
+upsert() {  # file key json mode(create|update)
+    local f="$S/$1.json" k="$2" obj="$3" mode="$4" uid
+    uid="$(jq -r .uid <<<"$obj")"
+    local exists; exists="$(j --arg u "$uid" "[.${k}[] | select(.uid == \$u)] | length" "$f")"
+    if [[ "$mode" == create && "$exists" != 0 ]]; then reply 400 '{"error":"exists"}'; fi
+    if [[ "$mode" == update && "$exists" == 0 ]]; then reply 404 '{"error":"not found"}'; fi
+    j --argjson o "$obj" ".${k} = ([.${k}[] | select(.uid != \$o.uid)] + [\$o])" "$f" > "$f.t" && mv "$f.t" "$f"
+    reply 200 ''
+}
+
+case "$method $path" in
+    "GET /devices")    reply 200 "$(cat "$S/devices.json")" ;;
+    "POST /status")    reply 200 "$(cat "$S/status.json")" ;;
+    "GET /profiles")   reply 200 "$(cat "$S/profiles.json")" ;;
+    "GET /functions")  reply 200 "$(cat "$S/functions.json")" ;;
+    "POST /profiles")  upsert profiles profiles "$data" create ;;
+    "PUT /profiles")   upsert profiles profiles "$data" update ;;
+    "POST /functions") upsert functions functions "$data" create ;;
+    "PUT /functions")  upsert functions functions "$data" update ;;
+    "DELETE /profiles/"*)
+        uid="${path#/profiles/}"
+        # Refused while a channel or a Mix still uses it, so a test catches an
+        # engine that deletes before it reassigns.
+        if cat "$S"/settings-*.json 2>/dev/null | j -s -e --arg u "$uid" '[.[].settings[] | select(.profile_uid == $u)] | length > 0' >/dev/null \
+           || j -e --arg u "$uid" '[.profiles[] | select(.member_profile_uids // [] | index($u))] | length > 0' "$S/profiles.json" >/dev/null; then
+            reply 409 '{"error":"profile in use"}'
+        fi
+        j --arg u "$uid" '.profiles |= map(select(.uid != $u))' "$S/profiles.json" > "$S/p.t" && mv "$S/p.t" "$S/profiles.json"
+        reply 200 '' ;;
+    "DELETE /functions/"*)
+        uid="${path#/functions/}"
+        j --arg u "$uid" '.functions |= map(select(.uid != $u))' "$S/functions.json" > "$S/f.t" && mv "$S/f.t" "$S/functions.json"
+        reply 200 '' ;;
+    "GET /devices/"*/settings)
+        duid="${path#/devices/}"; duid="${duid%/settings}"
+        f="$S/settings-${duid}.json"; [[ -f "$f" ]] || echo '{"settings":[]}' > "$f"
+        reply 200 "$(cat "$f")" ;;
+    "PUT /devices/"*/settings/*/profile|"PUT /devices/"*/settings/*/manual)
+        # A channel has a profile OR a fixed duty, never both — the same as the
+        # daemon's Setting, where applying one replaces the other.
+        rest="${path#/devices/}"; duid="${rest%%/*}"; ch="${rest#*/settings/}"; route="${ch##*/}"; ch="${ch%/*}"
+        known="$(j -r --arg u "$duid" --arg c "$ch" \
+            '[.devices[] | select(.uid == $u) | .info.channels[$c] | select(. != null)] | length' "$S/devices.json")"
+        [[ "$known" == 1 ]] || reply 404 '{"error":"no such channel"}'
+        if [[ "$route" == profile ]]; then
+            puid="$(jq -r .profile_uid <<<"$data")"
+            j -e --arg u "$puid" '.profiles[] | select(.uid == $u)' "$S/profiles.json" >/dev/null \
+                || reply 404 '{"error":"no such profile"}'
+            new="$(j -n --arg c "$ch" --arg p "$puid" '{channel_name: $c, profile_uid: $p, speed_fixed: null}')"
+        else
+            new="$(j -n --arg c "$ch" --argjson d "$(jq .speed_fixed <<<"$data")" '{channel_name: $c, profile_uid: null, speed_fixed: $d}')"
+        fi
+        f="$S/settings-${duid}.json"; [[ -f "$f" ]] || echo '{"settings":[]}' > "$f"
+        j --arg c "$ch" --argjson n "$new" \
+            '.settings = ([.settings[] | select(.channel_name != $c)] + [$n])' \
+            "$f" > "$f.t" && mv "$f.t" "$f"
+        reply 200 '' ;;
+esac
+reply 404 '{"error":"no route"}'
