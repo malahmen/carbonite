@@ -87,6 +87,7 @@ config                   the resolved state as key=value
 | `--pin "ID@N"` | with `apply`: pin these first, before any curve change |
 | `--hyst` | `3` °C |
 | `--delay` | `3` s |
+| `--allow-stop` | off: a curve that reaches 0% is refused while any fan on it has no floor |
 | `--url` | `http://127.0.0.1:11987` (`$CARB_URL`) |
 
 ## The curve
@@ -107,6 +108,11 @@ $ ./carbonite.sh simulate --curve "30:25 50:35 65:55 75:75 85:100" 20 57 80 95
 A curve CoolerControl would silently rewrite (for example, a duty that falls
 as the temperature rises) is refused, so `simulate` never shows anything
 different from what will run.
+
+**A curve that reaches 0% stops the fans there.** `apply` and `set-curve`
+refuse one while any fan on it has no floor, naming those fans; give each a
+floor (`ID@N`), which lifts its 0% to N%, or pass `--allow-stop` if they may
+really stop. `simulate` only warns.
 
 ## Ids
 
@@ -146,8 +152,10 @@ tests/run-all.sh
 
 No daemon, no token, no hardware. `tests/fake-coolercontrol` stands in for
 `curl` (`$CARB_CURL`) as a small, stateful CoolerControl with 4.3.1's routes and
-shapes. It refuses to delete a profile that is still in use, so an engine that
-deletes before it reassigns fails a test. `tests/fixture.sh` is its starting state, shared with scomp-link's
+shapes, decoding the path as the daemon does. It refuses to delete a profile
+that is still in use, so an engine that deletes before it reassigns fails a
+test. CI (`.github/workflows/ci.yml`) runs shellcheck and the suite on every
+push and pull request. `tests/fixture.sh` is its starting state, shared with scomp-link's
 front-end test.
 
 ## License

@@ -1,0 +1,36 @@
+name: ci
+
+# Every push and pull request. The suite needs no network, no hardware and no
+# daemon: it runs against a fake, stateful CoolerControl that stands in for
+# curl (tests/fake-coolercontrol), the way thermal-exhaust-port's runs against
+# a fake hwmon tree.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone.
+        run: |
+          bash --version | head -1
+          shellcheck --version | sed -n 2p
+          jq --version
+
+      - name: shellcheck
+        # Globbed, not listed: a named list quietly stops covering the next test
+        # file somebody adds. fake-coolercontrol has no .sh suffix, so it is named.
+        run: shellcheck -S warning carbonite.sh tests/*.sh tests/fake-coolercontrol
+
+      - name: tests
+        run: tests/run-all.sh
