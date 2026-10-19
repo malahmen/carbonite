@@ -73,6 +73,7 @@ SYSTEMCTL="${CARB_SYSTEMCTL:-systemctl}"
 DEFAULT_CURVE="30:25 50:35 65:55 75:75 85:100"
 CURVE=""; SENSORS=""; CHANNELS=""; PIN=""; HYST=""; DELAY=""
 YES=0
+ALLOW_STOP=0
 
 PREFIX="carbonite"
 FN_UID="${PREFIX}-fn"
@@ -146,6 +147,8 @@ Flags:
   --pin "ID@N ..."         with apply: pin these first, before any curve change
   --hyst N                 degC to fall before slowing down (default: 3)
   --delay N                seconds a drop must last before slowing down (default: 3)
+  --allow-stop             let a curve that reaches 0% stop fans with no floor (@N);
+                           without it apply and set-curve refuse such a curve
   --url URL                CoolerControl API (default: http://127.0.0.1:11987)
   --token TOKEN            access token (also \$CARB_TOKEN)
   --yes                    do not ask (release, unpin)
@@ -180,6 +183,27 @@ parse_curve() {
     done
     (( ${#CT[@]} >= 2 )) || { error "a curve needs at least two points"; return 1; }
     return 0
+}
+
+# _stop_below — the hottest temperature at which the parsed curve is at 0%
+# (fans stopped), or nothing if it never reaches 0%. Below the first point
+# the first duty holds, so a curve starting at 0% stops fans from cold.
+_stop_below() {
+    local i t=""
+    for (( i = 0; i < ${#CT[@]}; i++ )); do (( CD[i] == 0 )) && t="${CT[i]}"; done
+    printf '%s' "$t"
+}
+
+# _refuse_stopping_fans "SPEC ..." — a curve that reaches 0% stops every fan on
+# it that has no floor (@N); refused unless --allow-stop says that is meant.
+# A floor lifts the 0% for its fan (_floored_json), so floored fans pass.
+_refuse_stopping_fans() {
+    local t s bare=""
+    t="$(_stop_below)"
+    [[ -n "$t" ]] && (( ! ALLOW_STOP )) || return 0
+    for s in $1; do [[ -n "$(_spec_n "$s")" ]] || bare+="$(_spec_id "$s") "; done
+    [[ -n "$bare" ]] || return 0
+    error_exit "the curve is at 0% up to ${t}C, which STOPS ${bare% } there. Give each a floor (ID@N, e.g. ID@20), or pass --allow-stop if they may stop."
 }
 
 # duty_at T — CoolerControl's interpolate_profile: clamp at the ends, linear
@@ -377,11 +401,16 @@ _resolve() {
     awk -F'\t' -v id="$id" '$1 == id { print $2 "\t" $3; exit }' <<<"$rows"
 }
 
+# _uri TEXT — TEXT percent-encoded for one URL path segment.
+_uri() { jq -rn --arg s "$1" '$s | @uri'; }
+
 # _channel_put ID ROUTE JSON — a write to one channel's settings.
 _channel_put() {
     local r; r="$(_resolve channel "$1")"
     [[ -n "$r" ]] || { API_BODY='{"error":"no such channel on this host"}'; API_CODE=404; return 1; }
-    _api PUT "/devices/${r%%$'\t'*}/settings/${r#*$'\t'}/$2" "$3"
+    # Percent-encoded: a channel name is the daemon's, and a space or a "/"
+    # in it would break the URL or route the write somewhere else.
+    _api PUT "/devices/$(_uri "${r%%$'\t'*}")/settings/$(_uri "${r#*$'\t'}")/$2" "$3"
 }
 
 # -----------------------------------------------------------------------------
@@ -507,8 +536,8 @@ cmd_check() {
 
 cmd_sensors() {
     _need_api; _load_status; _load_profiles; _load_applied
-    local watch=" ${APPLIED_SENSORS} " id duid tname dname label t
-    while IFS=$'\t' read -r id duid tname dname label t; do
+    local watch=" ${APPLIED_SENSORS} " id duid dname label t
+    while IFS=$'\t' read -r id duid _ dname label t; do
         [[ -n "$id" ]] || continue
         printf '%s\t%s\t%s\t%s\t%d\n' "$id" "$dname" "$label" "$t" "$([[ "$watch" == *" $id "* ]] && echo 1 || echo 0)"
     done < <(_sensor_rows)
@@ -532,6 +561,8 @@ cmd_curve() {
 
 cmd_simulate() {
     parse_curve "${CURVE:-$DEFAULT_CURVE}" || exit 1
+    local stop; stop="$(_stop_below)"
+    [[ -z "$stop" ]] || warn "this curve is at 0% up to ${stop}C: fans on it stop there unless given a floor (ID@N); apply refuses it without one, or --allow-stop"
     (( $# )) || set -- 30 40 50 60 70 80 90
     local t
     for t in "$@"; do
@@ -614,6 +645,7 @@ cmd_apply() {
         [[ -n "$(_spec_n "$s")" ]] && floors+="$(_spec_n "$s") "
     done
     floors="$(printf '%s\n' $floors | sort -un | xargs)"
+    _refuse_stopping_fans "$channels"
 
     # Pins first: if anything below fails, a pump is already safe.
     if [[ -n "$pins" ]]; then _do_pins "$pins" || error_exit "a pin failed — the curve was not touched"; fi
@@ -660,6 +692,7 @@ cmd_set_curve() {
     parse_curve "$curve" || exit 1
     _need_api; _load_status; _load_profiles; _load_applied; _load_managed
     (( APPLIED )) || error_exit "nothing applied yet — use 'apply' first"
+    _refuse_stopping_fans "$(_curve_specs)"
     local floors s
     floors="$(for s in $(_curve_specs); do _spec_n "$s"; echo; done | grep . | sort -un | xargs)"
     _write_profiles "$curve" "$APPLIED_SENSORS" "${APPLIED_HYST:-3}" "${APPLIED_DELAY:-3}" "$floors" || exit 1
@@ -750,9 +783,9 @@ cmd_status() {
     else
         printf 'curve   : none applied — the board (or the GUI) is in charge\n'
     fi
-    local watch=" ${APPLIED_SENSORS} " id duid tname dname label t
+    local watch=" ${APPLIED_SENSORS} " id duid dname label t
     printf '\ntemps\n'
-    while IFS=$'\t' read -r id duid tname dname label t; do
+    while IFS=$'\t' read -r id duid _ dname label t; do
         [[ " $watch " == *" $id "* ]] || continue
         printf '  %-20s %-28s %4sC\n' "$id" "$label" "$t"
     done < <(_sensor_rows)
@@ -791,6 +824,7 @@ main() {
             --url)      [[ $# -ge 2 ]] || error_exit "--url needs URL";       url_flag="$2"; shift 2 ;;
             --token)    [[ $# -ge 2 ]] || error_exit "--token needs TOKEN";   token_flag="$2"; shift 2 ;;
             --yes|-y)   YES=1; shift ;;
+            --allow-stop) ALLOW_STOP=1; shift ;;
             -h|--help)  usage; exit 0 ;;
             --)         shift; rest+=("$@"); break ;;
             -*)         error_exit "unknown flag: $1 (see --help)" ;;

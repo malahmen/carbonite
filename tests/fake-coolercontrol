@@ -75,6 +75,8 @@ case "$method $path" in
         # A channel has a profile OR a fixed duty, never both — the same as the
         # daemon's Setting, where applying one replaces the other.
         rest="${path#/devices/}"; duid="${rest%%/*}"; ch="${rest#*/settings/}"; route="${ch##*/}"; ch="${ch%/*}"
+        # The daemon decodes the path's segments (%20, %2F, ...); so does this.
+        ch="$(printf '%b' "${ch//%/\\x}")"
         known="$(j -r --arg u "$duid" --arg c "$ch" \
             '[.devices[] | select(.uid == $u) | .info.channels[$c] | select(. != null)] | length' "$S/devices.json")"
         [[ "$known" == 1 ]] || reply 404 '{"error":"no such channel"}'

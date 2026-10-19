@@ -195,12 +195,44 @@ reset_cc; rm -rf "$CARB_CONFIG_DIR"
 eng pin "${NCT:0:8}:fan1@100"
 CARB_TOKEN="" eng login --token tok
 check "login succeeded"                             is "$RC" 0
-check "the file is mode 600"                        bash -c "[[ \$(stat -c %a '$CARB_CONFIG_DIR/config') == 600 ]]"
+# GNU stat -c, else BSD stat -f: the suite runs on a Mac too.
+check "the file is mode 600"                        bash -c "[[ \$(stat -c %a '$CARB_CONFIG_DIR/config' 2>/dev/null || stat -f %Lp '$CARB_CONFIG_DIR/config') == 600 ]]"
 check "the pin survived the login"                  grep -q 'fan1@100' "$CARB_CONFIG_DIR/config"
 CARB_TOKEN="" eng check
 check "the saved token is used"                     has "(file)" "$OUT"
 CARB_TOKEN="" eng login --token nope
 check "a refused token is not saved"                bash -c "grep -q '^token=tok$' '$CARB_CONFIG_DIR/config'"
+
+echo "## 15. a curve at 0% stops fans: refused unless floored or --allow-stop"
+F3="${NCT:0:8}:fan3" F7="${NCT:0:8}:fan7"
+eng simulate --curve "30:0 85:100" 25
+check "simulate warns that fans stop"               has "0% up to 30C" "$OUT"
+check "  and still shows the curve"                 has "25   0%" "$OUT"
+reset_cc; eng apply --curve "30:0 85:100" --channels "$F3 ${F7}@20"
+check "apply refuses it"                            bash -c "(( $RC != 0 ))"
+check "  naming the unfloored fan"                  has "STOPS ${F3}" "$OUT"
+check "  not the floored one"                       bash -c "! grep -q 'fan7' <<<\"\$1\"" _ "$OUT"
+check "  and writes nothing"                        bash -c "! grep -qE '^(POST|PUT|DELETE) /(profiles|functions|devices)' '$FAKE_CC/calls'"
+reset_cc; eng apply --curve "30:0 85:100" --channels "${F3}@20 ${F7}@25"
+check "every fan floored: applied"                  is "$RC" 0
+reset_cc; eng apply --curve "30:0 85:100" --channels "$F3" --allow-stop
+check "--allow-stop: applied as asked"              is "$RC" 0
+reset_cc; eng apply --channels "$F3"; eng set-curve "40:0 85:100"
+check "set-curve refuses it for the fans on the curve" bash -c "(( $RC != 0 )) && grep -q 'STOPS' <<<\"\$1\"" _ "$OUT"
+eng set-curve "40:0 85:100" --allow-stop
+check "  unless --allow-stop"                       is "$RC" 0
+eng simulate --curve "30:25 85:100" 25
+check "a curve that never reaches 0% warns nothing" bash -c "! grep -q 'warn' <<<\"\$1\"" _ "$OUT"
+
+echo "## 16. a channel name is encoded in the URL"
+reset_cc
+jq --arg u "$NCT" '(.devices[] | select(.uid == $u) | .info.channels) += {"Pump Fan/2": {"label": "Pump", "speed_options": {"min_duty":0,"max_duty":100,"fixed_enabled":true,"extension":null}}}' \
+    "$FAKE_CC/devices.json" > "$T/d.json" && mv "$T/d.json" "$FAKE_CC/devices.json"
+eng apply --channels "${NCT:0:8}:Pump_Fan/2"
+check "a space and a / in the name: applied"         is "$RC" 0
+check "  the path carries it encoded"               grep -qF "/settings/Pump%20Fan%2F2/profile" "$FAKE_CC/calls"
+pu="$(setting "$NCT" 'Pump Fan/2' profile_uid)"
+check "  and the setting is on that channel"        has carbonite "$pu"
 
 echo
 (( FAILS == 0 )) && { echo "all passed"; exit 0; }
