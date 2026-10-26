@@ -47,7 +47,7 @@ with `--pin`.
 
 ```sh
 # in CoolerControl: Settings → Access Tokens → new token WITH write access
-./carbonite.sh login --token cc_…
+./carbonite.sh login           # paste the token at the hidden prompt
 ./carbonite.sh sensors        # what can be watched
 ./carbonite.sh channels       # what can be driven
 ./carbonite.sh apply --curve "30:30 50:50 60:70 70:80 75:90 80:100" \
@@ -56,12 +56,20 @@ with `--pin`.
 ```
 
 The token is saved to `~/.config/carbonite/config` (mode 600). `$CARB_TOKEN`
-overrides it. Needs bash 4+, curl, jq and a running `coolercontrold`. No root.
+overrides it. `login` reads the token from stdin (a hidden prompt on a
+terminal, or piped: `printf '%s\n' "$tok" | ./carbonite.sh login`), falling
+back to `$CARB_TOKEN`.
+
+The token can set any fan's duty, so it is never put on a command line, where
+`ps` shows it to every user: curl gets the `Authorization` header from a config
+on its stdin (`curl -K -`), never from `-H`. `--token TOKEN` still works but is
+deprecated and warns, because it puts the token on carbonite's own argv. Needs bash 4+, curl, jq and a running `coolercontrold`. No root.
 
 ## Commands
 
 ```
-login --token TOKEN      save a CoolerControl access token (needs write access)
+login                    save a CoolerControl access token (needs write access),
+                         read from stdin (hidden prompt on a terminal, or piped)
 check                    is the daemon reachable and is the token accepted
 status                   applied curve, sensors, channels, temps, fan RPM
 sensors                  TSV: id  device  label  degC  watched
@@ -89,6 +97,7 @@ config                   the resolved state as key=value
 | `--delay` | `3` s |
 | `--allow-stop` | off: a curve that reaches 0% is refused while any fan on it has no floor |
 | `--url` | `http://127.0.0.1:11987` (`$CARB_URL`) |
+| `--token` | deprecated, warns: puts the token on argv; use `login` or `$CARB_TOKEN` |
 
 ## The curve
 
@@ -113,6 +122,11 @@ different from what will run.
 refuse one while any fan on it has no floor, naming those fans; give each a
 floor (`ID@N`), which lifts its 0% to N%, or pass `--allow-stop` if they may
 really stop. `simulate` only warns.
+
+**Weak settings are warned about, not refused.** A curve whose hottest duty is
+under 70% (`30:25 90:30`) never speeds the fans up under a sustained load, and
+a pin under 50% is too slow for most AIO pumps. `simulate`, `apply`,
+`set-curve` and `pin` say so and carry on, since either can be meant.
 
 ## Ids
 
@@ -139,6 +153,10 @@ across reboots, unlike hwmon indices.
 - **`release`** sets the channels to CoolerControl's Default profile, which
   restores the board's own `pwm_enable` mode, then deletes the objects. It
   stops before deleting if any channel could not be handed back.
+- **A device whose fan settings cannot be read** (two tries) is named in a
+  warning, and while it is unreadable `apply` does not prune and `release`
+  does not delete: a fan there may still be on a carbonite profile. Both exit
+  non-zero; run them again once CoolerControl answers for that device.
 - **Other pwm writers** (`fancontrol`, `fan2go`, `thermal-exhaust-port`,
   `nbfc`) fight CoolerControl. `conflicts`, `apply` and `status` say so.
 - Written against coolercontrold **4.3.1**: routes, JSON shapes and validation
@@ -152,7 +170,11 @@ tests/run-all.sh
 
 No daemon, no token, no hardware. `tests/fake-coolercontrol` stands in for
 `curl` (`$CARB_CURL`) as a small, stateful CoolerControl with 4.3.1's routes and
-shapes, decoding the path as the daemon does. It refuses to delete a profile
+shapes, decoding the path as the daemon does. It takes the token only from a
+curl config on stdin and logs every argv, so a test fails if the token ever
+reaches a command line. A line in `$FAKE_CC/fail` (an ERE on
+"METHOD PATH") makes matching calls answer 500, so the failure paths (a pin,
+a hand-back, a settings read) are tested, not only the happy ones. It refuses to delete a profile
 that is still in use, so an engine that deletes before it reassigns fails a
 test. CI (`.github/workflows/ci.yml`) runs shellcheck and the suite on every
 push and pull request. `tests/fixture.sh` is its starting state, shared with scomp-link's

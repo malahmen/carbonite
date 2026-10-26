@@ -25,6 +25,8 @@ FAILS=0
 check() { local d="$1"; shift; if "$@"; then echo "   ok   - $d"; else echo "   FAIL - $d"; FAILS=$((FAILS + 1)); fi; }
 has()   { case "$2" in *"$1"*) return 0 ;; *) return 1 ;; esac; }
 eng()   { OUT="$(bash "$ENGINE" "$@" 2>&1)"; RC=$?; }
+# eng_in INPUT ARGS... — eng with INPUT on stdin.
+eng_in() { local in="$1"; shift; OUT="$(printf '%s' "$in" | bash "$ENGINE" "$@" 2>&1)"; RC=$?; }
 # setting DEVICE_UID CHANNEL FIELD — one field of a channel's stored setting.
 setting() { jq -r --arg c "$2" ".settings[] | select(.channel_name == \$c) | .$3 // \"null\"" "$FAKE_CC/settings-$1.json" 2>/dev/null; }
 is()      { [[ "$1" == "$2" ]]; }
@@ -190,18 +192,31 @@ rm "$FAKE_CC/readonly"
 CARB_TOKEN="" eng config
 check "config works with no token"                  has "authorized=0" "$OUT"
 
-echo "## 14. login saves the token privately, and keeps the pins"
+echo "## 14. login reads the token from stdin, saves it privately, keeps the pins"
 reset_cc; rm -rf "$CARB_CONFIG_DIR"
 eng pin "${NCT:0:8}:fan1@100"
-CARB_TOKEN="" eng login --token tok
+CARB_TOKEN="" eng_in $'tok\n' login
 check "login succeeded"                             is "$RC" 0
+check "  with the token from stdin"                 grep -q '^token=tok$' "$CARB_CONFIG_DIR/config"
 # GNU stat -c, else BSD stat -f: the suite runs on a Mac too.
 check "the file is mode 600"                        bash -c "[[ \$(stat -c %a '$CARB_CONFIG_DIR/config' 2>/dev/null || stat -f %Lp '$CARB_CONFIG_DIR/config') == 600 ]]"
 check "the pin survived the login"                  grep -q 'fan1@100' "$CARB_CONFIG_DIR/config"
 CARB_TOKEN="" eng check
 check "the saved token is used"                     has "(file)" "$OUT"
-CARB_TOKEN="" eng login --token nope
+CARB_TOKEN="" eng_in $'nope\n' login
 check "a refused token is not saved"                bash -c "grep -q '^token=tok$' '$CARB_CONFIG_DIR/config'"
+CARB_TOKEN="" eng login </dev/null
+check "no token on stdin: refused"                  bash -c "(( $RC != 0 ))"
+check "  saying how to give it"                     has "reads the token from stdin" "$OUT"
+CARB_TOKEN="" eng_in $'cc_two words\n' login
+check "a token with a space is refused"             bash -c "(( $RC != 0 ))"
+rm -rf "$CARB_CONFIG_DIR"
+CARB_TOKEN="" eng login --token tok </dev/null
+check "the deprecated --token still logs in"        grep -q '^token=tok$' "$CARB_CONFIG_DIR/config"
+check "  and warns that argv is public"             has "command line" "$OUT"
+rm -rf "$CARB_CONFIG_DIR"
+CARB_TOKEN=tok eng login </dev/null
+check "login takes \$CARB_TOKEN"                   grep -q '^token=tok$' "$CARB_CONFIG_DIR/config"
 
 echo "## 15. a curve at 0% stops fans: refused unless floored or --allow-stop"
 F3="${NCT:0:8}:fan3" F7="${NCT:0:8}:fan7"
@@ -233,6 +248,92 @@ check "a space and a / in the name: applied"         is "$RC" 0
 check "  the path carries it encoded"               grep -qF "/settings/Pump%20Fan%2F2/profile" "$FAKE_CC/calls"
 pu="$(setting "$NCT" 'Pump Fan/2' profile_uid)"
 check "  and the setting is on that channel"        has carbonite "$pu"
+
+echo "## 17. the token is never on curl's command line"
+# ps shows every process's argv to every user; the token can set any fan.
+SECRET='cc_S3cret\to"k'
+reset_cc; rm -rf "$CARB_CONFIG_DIR"; printf '%s\n' "$SECRET" > "$FAKE_CC/token"
+CARB_TOKEN="$SECRET" eng apply --pin "${NCT:0:8}:fan1@100" --channels "${NCT:0:8}:fan3"
+check "apply succeeded, the token sent on stdin"    is "$RC" 0
+check "  a \\ and a \" in it survive curl's quoting" is "$(setting "$NCT" fan3 profile_uid)" carbonite
+check "curl was run"                                bash -c "[[ -s '$FAKE_CC/argv' ]]"
+check "  and its argv never held the token"         bash -c '! grep -qF -- "$1" "$2"' _ "$SECRET" "$FAKE_CC/argv"
+check "  nor any Authorization header"              bash -c "! grep -q Authorization '$FAKE_CC/argv'"
+: > "$FAKE_CC/argv"
+CARB_TOKEN="" eng_in "$SECRET"$'\n' login
+check "login from stdin works with it"              is "$RC" 0
+CARB_TOKEN="" eng release --yes
+check "  and the saved token is used"               is "$RC" 0
+check "  never on curl's argv"                      bash -c '! grep -qF -- "$1" "$2"' _ "$SECRET" "$FAKE_CC/argv"
+
+echo "## 18. a failed step stops everything after it"
+F1="${NCT:0:8}:fan1" F2="${NCT:0:8}:fan2" F3="${NCT:0:8}:fan3"
+reset_cc; echo 'PUT /devices/[^/]+/settings/fan1/manual' > "$FAKE_CC/fail"
+eng apply --pin "${F1}@100" --channels "$F3"
+check "a failed --pin fails apply"                  bash -c "(( $RC != 0 ))"
+check "  saying the curve was not touched"          has "curve was not touched" "$OUT"
+check "  and nothing was written after the pin"     bash -c "! grep -qE '^(POST|PUT) /(profiles|functions)|/fan3/' '$FAKE_CC/calls'"
+check "  the fan the curve would take is untouched" is "$(setting "$NCT" fan3 profile_uid)" ""
+reset_cc; eng apply --channels "${F2}@45 $F3"; : > "$FAKE_CC/calls"
+echo 'PUT /devices/[^/]+/settings/fan2/profile' > "$FAKE_CC/fail"
+eng apply --channels "$F3"
+check "a failed hand-back fails apply"              bash -c "(( $RC != 0 ))"
+check "  and nothing is pruned"                     bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the 45% set its fan still uses is kept"    is "$(prof carbonite-m45 .uid)" '"carbonite-m45"'
+check "  and that fan is still on it"               is "$(setting "$NCT" fan2 profile_uid)" carbonite-m45
+reset_cc; eng apply --channels "$F3"; : > "$FAKE_CC/calls"
+echo 'PUT /devices/[^/]+/settings/fan3/profile' > "$FAKE_CC/fail"
+eng release --yes
+check "a failed hand-back fails release"            bash -c "(( $RC != 0 ))"
+check "  saying it is not deleting"                 has "not deleting" "$OUT"
+check "  and nothing was deleted"                   bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the function is kept too"                  grep -q carbonite-fn "$FAKE_CC/functions.json"
+rm -f "$FAKE_CC/fail"
+
+echo "## 19. a device whose settings cannot be read blocks pruning and deleting"
+G1="${GPU:0:8}:fan1"
+reset_cc; eng apply --channels "${F2}@45 $G1"; : > "$FAKE_CC/calls"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail"
+eng apply --channels "$G1"
+check "apply fails"                                 bash -c "(( $RC != 0 ))"
+check "  naming the unreadable device"              has "${NCT:0:8}" "$OUT"
+check "  and nothing is pruned"                     bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the fan there keeps its 45% set"           is "$(prof carbonite-m45 .uid)" '"carbonite-m45"'
+rm -f "$FAKE_CC/fail"
+eng apply --channels "$G1"
+check "once readable, apply hands the fan back"     is "$(setting "$NCT" fan2 profile_uid)" 0
+check "  and prunes its set"                        bash -c "! grep -q carbonite-m45 '$FAKE_CC/profiles.json'"
+reset_cc; eng apply --channels "${F2}@45 $G1"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail-once"
+eng apply --channels "$G1"
+check "a read that fails once is retried"           is "$RC" 0
+check "  and the fan is handed back"                is "$(setting "$NCT" fan2 profile_uid)" 0
+reset_cc; eng apply --channels "$F3"; : > "$FAKE_CC/calls"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail"
+eng release --yes
+check "release fails"                               bash -c "(( $RC != 0 ))"
+check "  deleting nothing"                          bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the fan keeps its profile"                 is "$(setting "$NCT" fan3 profile_uid)" carbonite
+check "  and the function"                          grep -q carbonite-fn "$FAKE_CC/functions.json"
+rm -f "$FAKE_CC/fail"
+
+echo "## 20. a weak pin or curve is applied, with a warning"
+reset_cc; eng apply --pin "${F1}@30" --channels "$F3"
+check "a pin below 50% is applied"                  is "$(setting "$NCT" fan1 speed_fixed)" 30
+check "  with a warning about pumps"                has "most AIO pumps want 50%" "$OUT"
+eng pin "${F1}@20"
+check "pin warns too"                               has "most AIO pumps want 50%" "$OUT"
+eng pin "${F1}@50"
+check "a pin at 50% warns nothing"                  bash -c "! grep -q 'pumps want' <<<\"\$1\"" _ "$OUT"
+eng simulate --curve "30:25 90:30" 50
+check "simulate warns on a curve topping out at 30%" has "tops out at 30%" "$OUT"
+reset_cc; eng apply --curve "30:25 90:30" --channels "$F3"
+check "apply applies it"                            is "$RC" 0
+check "  with the warning"                          has "tops out at 30%" "$OUT"
+eng set-curve "30:25 90:69"
+check "set-curve warns below 70%"                   has "tops out at 69%" "$OUT"
+eng set-curve "30:25 90:70"
+check "a curve reaching 70% warns nothing"          bash -c "! grep -q 'tops out' <<<\"\$1\"" _ "$OUT"
 
 echo
 (( FAILS == 0 )) && { echo "all passed"; exit 0; }

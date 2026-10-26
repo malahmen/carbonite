@@ -37,7 +37,11 @@
 #
 # Requirements: bash >= 4, curl, jq, a running coolercontrold, and an access
 # token with write access (CoolerControl → Settings → Access Tokens), saved
-# once with `carbonite.sh login --token cc_…`.
+# once with `carbonite.sh login` (it reads the token from stdin).
+#
+# The token can set any fan's duty, so it is never put on a command line:
+# `ps` shows every process's argv to every user. curl gets the header from a
+# config on its stdin (-K -), and login reads the token from stdin.
 # -----------------------------------------------------------------------------
 
 if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
@@ -75,6 +79,13 @@ CURVE=""; SENSORS=""; CHANNELS=""; PIN=""; HYST=""; DELAY=""
 YES=0
 ALLOW_STOP=0
 
+# Below these a setting is allowed but said: a pump under ~50% can starve the
+# CPU block, and a curve that tops out low never speeds the fans up under a
+# sustained load. Warnings, not refusals — a quiet pump or a capped curve can
+# be what is meant.
+WEAK_PIN=50
+WEAK_TOP=70
+
 PREFIX="carbonite"
 FN_UID="${PREFIX}-fn"
 TOP_UID="${PREFIX}"
@@ -105,6 +116,8 @@ _read_conf() {
     URL="${URL%/}"
 }
 
+_valid_token() { [[ "$1" =~ ^[^[:space:][:cntrl:]]+$ ]]; }
+
 # Writes what is on file, never a token that only came from the environment.
 _write_conf() {
     mkdir -p "$CONF_DIR"
@@ -121,7 +134,8 @@ carbonite.sh ${VERSION} — a fan curve for hwmon fans, applied through CoolerCo
 Usage: carbonite.sh COMMAND [flags]
 
 Commands:
-  login --token TOKEN      save a CoolerControl access token (needs write access)
+  login                    save a CoolerControl access token (needs write access),
+                           read from stdin: a hidden prompt on a terminal, or piped
   check                    is the daemon reachable and is the token accepted
   status                   applied curve, sensors, channels, temps, fan RPM
   sensors                  every temperature source, TSV: id<TAB>device<TAB>label<TAB>degC<TAB>watched
@@ -150,7 +164,8 @@ Flags:
   --allow-stop             let a curve that reaches 0% stop fans with no floor (@N);
                            without it apply and set-curve refuse such a curve
   --url URL                CoolerControl API (default: http://127.0.0.1:11987)
-  --token TOKEN            access token (also \$CARB_TOKEN)
+  --token TOKEN            deprecated: puts the token on argv, where ps shows it to
+                           every user. Use 'login' (stdin) or \$CARB_TOKEN
   --yes                    do not ask (release, unpin)
 
 Between points the duty is interpolated linearly, as CoolerControl does; below
@@ -206,6 +221,13 @@ _refuse_stopping_fans() {
     error_exit "the curve is at 0% up to ${t}C, which STOPS ${bare% } there. Give each a floor (ID@N, e.g. ID@20), or pass --allow-stop if they may stop."
 }
 
+# _warn_weak_curve — the parsed curve's hottest duty is under WEAK_TOP.
+_warn_weak_curve() {
+    local n=${#CD[@]}
+    (( CD[n-1] < WEAK_TOP )) || return 0
+    warn "this curve tops out at ${CD[n-1]}% (from ${CT[n-1]}C up): under a sustained load the fans on it never go faster. Most curves end at 100%."
+}
+
 # duty_at T — CoolerControl's interpolate_profile: clamp at the ends, linear
 # between, rounded half away from zero.
 duty_at() {
@@ -232,13 +254,24 @@ _curve_json() {
 # -----------------------------------------------------------------------------
 API_BODY=""; API_CODE=""
 
+# _curl_config — the curl config carrying the token, for `curl -K -`. A -H on
+# curl's argv would show the token to every user in `ps` for as long as the
+# call runs (up to 15 s); a config on stdin is seen by curl alone. Quoted the
+# way curl's config parser unquotes: \\ and \".
+_curl_config() {
+    [[ -n "$TOKEN" ]] || return 0
+    local bs='\' q='"' t
+    t="${TOKEN//"$bs"/"$bs$bs"}"; t="${t//"$q"/"$bs$q"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$t"
+}
+
 # _api METHOD PATH [JSON] — sets API_BODY/API_CODE; 0 on 2xx.
 _api() {
     local method="$1" path="$2" data="${3:-}" out
     local -a args=(-sS -X "$method" -H "Accept: application/json" --max-time 15)
-    [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer ${TOKEN}")
     [[ -n "$data" ]] && args+=(-H "Content-Type: application/json" --data "$data")
-    out="$("$CURL" "${args[@]}" -w $'\n%{http_code}' "${URL}${path}" 2>/dev/null)" || {
+    # printf is a builtin: the token is never any process's argument.
+    out="$(_curl_config | "$CURL" -K - "${args[@]}" -w $'\n%{http_code}' "${URL}${path}" 2>/dev/null)" || {
         API_BODY=""; API_CODE="000"; return 1; }
     API_CODE="${out##*$'\n'}"
     API_BODY="${out%$'\n'*}"
@@ -256,7 +289,7 @@ _need_api() {
     command -v "$CURL" &>/dev/null || error_exit "curl is required."
     command -v jq &>/dev/null || error_exit "jq is required."
     _api GET /handshake || error_exit "CoolerControl is not answering at ${URL} — is coolercontrold running? (systemctl status coolercontrold)"
-    [[ -n "$TOKEN" ]] || error_exit "no access token. Create one with write access in CoolerControl (Settings → Access Tokens), then: carbonite.sh login --token cc_…"
+    [[ -n "$TOKEN" ]] || error_exit "no access token. Create one with write access in CoolerControl (Settings → Access Tokens), then: carbonite.sh login"
     _api GET /devices || error_exit "CoolerControl refused the token: $(_api_err)"
     DEVICES="$API_BODY"
 }
@@ -324,12 +357,21 @@ _pins_set() { _pins_drop "$1"; PINS="$(echo "$PINS $1@$2" | xargs)"; }
 
 # What controls each channel, from CoolerControl's own settings (so it reflects
 # the GUI too): CONTROL[id] = curve | curve:N | pin:N | fixed:N.
+#
+# A device whose settings cannot be read (tried twice) is listed in UNREAD and
+# warned about: its channels may be on a carbonite profile nobody here knows
+# of, so apply must not prune and release must not delete while it is set —
+# that would pull a profile from under a fan never handed back.
 declare -A CONTROL=()
+UNREAD=""
 _load_managed() {
-    CONTROL=()
+    CONTROL=(); UNREAD=""
     local duid ch kind val id
     while IFS= read -r duid; do
-        _api GET "/devices/${duid}/settings" || continue
+        if ! _api GET "/devices/${duid}/settings" && ! _api GET "/devices/${duid}/settings"; then
+            warn "could not read the fan settings of device ${duid:0:8}: $(_api_err)"
+            UNREAD+="${duid:0:8} "; continue
+        fi
         while IFS=$'\t' read -r ch kind val; do
             [[ -n "$ch" ]] || continue
             id="${duid:0:8}:${ch// /_}"
@@ -520,8 +562,26 @@ _prune() {
 # -----------------------------------------------------------------------------
 # Commands
 # -----------------------------------------------------------------------------
+# login takes the token, in this order, from: --token (deprecated, warned in
+# main), stdin when it is not a terminal (`printf '%s\n' "$tok" | carbonite.sh
+# login`), $CARB_TOKEN, or a hidden prompt on a terminal. Never from the file:
+# login is how the file's token is replaced.
 cmd_login() {
-    [[ -n "$TOKEN" ]] || error_exit "login needs --token TOKEN"
+    local tok=""
+    if [[ "$TOKEN_SOURCE" == flag ]]; then
+        tok="$TOKEN"
+    elif [[ ! -t 0 ]]; then
+        IFS= read -r tok || true
+    fi
+    if [[ -z "$tok" && -n "${CARB_TOKEN:-}" ]]; then
+        tok="$CARB_TOKEN"
+    elif [[ -z "$tok" && -t 0 ]]; then
+        read -r -s -p "CoolerControl access token (with write access): " tok; echo >&2
+    fi
+    tok="${tok%$'\r'}"
+    [[ -n "$tok" ]] || error_exit "login reads the token from stdin: printf '%s\n' cc_… | carbonite.sh login (or run it on a terminal and paste it)"
+    _valid_token "$tok" || error_exit "that token has spaces or control characters — paste just the token"
+    TOKEN="$tok"
     _api GET /handshake || error_exit "CoolerControl is not answering at ${URL}"
     _api GET /devices || error_exit "CoolerControl refused that token: $(_api_err)"
     FILE_TOKEN="$TOKEN"
@@ -563,6 +623,7 @@ cmd_simulate() {
     parse_curve "${CURVE:-$DEFAULT_CURVE}" || exit 1
     local stop; stop="$(_stop_below)"
     [[ -z "$stop" ]] || warn "this curve is at 0% up to ${stop}C: fans on it stop there unless given a floor (ID@N); apply refuses it without one, or --allow-stop"
+    _warn_weak_curve
     (( $# )) || set -- 30 40 50 60 70 80 90
     local t
     for t in "$@"; do
@@ -576,6 +637,7 @@ _do_pins() {
     local s id n fails=0
     for s in $1; do
         id="$(_spec_id "$s")"; n="$(_spec_n "$s")"
+        (( 10#$n >= WEAK_PIN )) || warn "${id} pinned at ${n}%: if it is a pump, most AIO pumps want ${WEAK_PIN}% or more (many run at 100%); a slow pump can starve the CPU block."
         if _channel_put "$id" manual "{\"speed_fixed\":${n}}"; then
             _pins_set "$id" "$n"; success "${id} pinned at ${n}%"
         else
@@ -621,6 +683,7 @@ cmd_apply() {
     _need_api; _load_status
     local curve="${CURVE:-$DEFAULT_CURVE}" sensors="${SENSORS:-}" channels="${CHANNELS:-}" pins="${PIN:-}"
     parse_curve "$curve" || exit 1
+    _warn_weak_curve
     [[ -n "$sensors" ]]  || sensors="$(_default_sensors)"
     [[ -n "$sensors" ]]  || error_exit "no CPU/GPU sensor found to default to — pass --sensors (see 'sensors')"
     # No default: a pump's header cannot be told from its label, and a pump on
@@ -680,6 +743,10 @@ cmd_apply() {
             error "${id}: could not hand back: $(_api_err)"; fails=$((fails + 1))
         fi
     done
+    if [[ -n "$UNREAD" ]]; then
+        error "not pruning: the settings of ${UNREAD% } could not be read, so a fan there may still use a carbonite profile. Run apply again once CoolerControl answers for it."
+        fails=$((fails + 1))
+    fi
     (( fails == 0 )) && _prune
     _warn_conflicts
     (( fails == 0 )) || exit 1
@@ -690,6 +757,7 @@ cmd_set_curve() {
     [[ -n "$curve" ]] || error_exit "set-curve needs POINTS"
     # Validated before anything is touched.
     parse_curve "$curve" || exit 1
+    _warn_weak_curve
     _need_api; _load_status; _load_profiles; _load_applied; _load_managed
     (( APPLIED )) || error_exit "nothing applied yet — use 'apply' first"
     _refuse_stopping_fans "$(_curve_specs)"
@@ -719,6 +787,7 @@ cmd_release() {
         fi
     done
     (( fails == 0 )) || error_exit "some channels still use a carbonite profile — not deleting them"
+    [[ -z "$UNREAD" ]] || error_exit "the settings of ${UNREAD% } could not be read, so a fan there may still use a carbonite profile — not deleting them. Run release again once CoolerControl answers for it."
 
     KEPT=(); _prune
     _api DELETE "/functions/${FN_UID}" &>/dev/null
@@ -834,7 +903,13 @@ main() {
 
     _read_conf
     [[ -n "$url_flag" ]] && URL="${url_flag%/}"
-    if [[ -n "$token_flag" ]]; then TOKEN="$token_flag"; TOKEN_SOURCE="flag"; fi
+    if [[ -n "$token_flag" ]]; then
+        # Kept so existing scripts still work, but said: argv is public.
+        warn "--token puts the token on this process's command line, where 'ps' shows it to every user. Pipe it to 'carbonite.sh login' instead, or set \$CARB_TOKEN."
+        TOKEN="$token_flag"; TOKEN_SOURCE="flag"
+    fi
+    # A newline in it would be a second header in curl's config.
+    [[ -z "$TOKEN" ]] || _valid_token "$TOKEN" || error_exit "the access token (${TOKEN_SOURCE}) has spaces or control characters"
 
     case "$cmd" in
         login)        cmd_login ;;
