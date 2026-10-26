@@ -37,7 +37,11 @@
 #
 # Requirements: bash >= 4, curl, jq, a running coolercontrold, and an access
 # token with write access (CoolerControl → Settings → Access Tokens), saved
-# once with `carbonite.sh login --token cc_…`.
+# once with `carbonite.sh login` (it reads the token from stdin).
+#
+# The token can set any fan's duty, so it is never put on a command line:
+# `ps` shows every process's argv to every user. curl gets the header from a
+# config on its stdin (-K -), and login reads the token from stdin.
 # -----------------------------------------------------------------------------
 
 if [[ "${BASH_VERSINFO[0]:-0}" -lt 4 ]]; then
@@ -105,6 +109,8 @@ _read_conf() {
     URL="${URL%/}"
 }
 
+_valid_token() { [[ "$1" =~ ^[^[:space:][:cntrl:]]+$ ]]; }
+
 # Writes what is on file, never a token that only came from the environment.
 _write_conf() {
     mkdir -p "$CONF_DIR"
@@ -121,7 +127,8 @@ carbonite.sh ${VERSION} — a fan curve for hwmon fans, applied through CoolerCo
 Usage: carbonite.sh COMMAND [flags]
 
 Commands:
-  login --token TOKEN      save a CoolerControl access token (needs write access)
+  login                    save a CoolerControl access token (needs write access),
+                           read from stdin: a hidden prompt on a terminal, or piped
   check                    is the daemon reachable and is the token accepted
   status                   applied curve, sensors, channels, temps, fan RPM
   sensors                  every temperature source, TSV: id<TAB>device<TAB>label<TAB>degC<TAB>watched
@@ -150,7 +157,8 @@ Flags:
   --allow-stop             let a curve that reaches 0% stop fans with no floor (@N);
                            without it apply and set-curve refuse such a curve
   --url URL                CoolerControl API (default: http://127.0.0.1:11987)
-  --token TOKEN            access token (also \$CARB_TOKEN)
+  --token TOKEN            deprecated: puts the token on argv, where ps shows it to
+                           every user. Use 'login' (stdin) or \$CARB_TOKEN
   --yes                    do not ask (release, unpin)
 
 Between points the duty is interpolated linearly, as CoolerControl does; below
@@ -232,13 +240,24 @@ _curve_json() {
 # -----------------------------------------------------------------------------
 API_BODY=""; API_CODE=""
 
+# _curl_config — the curl config carrying the token, for `curl -K -`. A -H on
+# curl's argv would show the token to every user in `ps` for as long as the
+# call runs (up to 15 s); a config on stdin is seen by curl alone. Quoted the
+# way curl's config parser unquotes: \\ and \".
+_curl_config() {
+    [[ -n "$TOKEN" ]] || return 0
+    local bs='\' q='"' t
+    t="${TOKEN//"$bs"/"$bs$bs"}"; t="${t//"$q"/"$bs$q"}"
+    printf 'header = "Authorization: Bearer %s"\n' "$t"
+}
+
 # _api METHOD PATH [JSON] — sets API_BODY/API_CODE; 0 on 2xx.
 _api() {
     local method="$1" path="$2" data="${3:-}" out
     local -a args=(-sS -X "$method" -H "Accept: application/json" --max-time 15)
-    [[ -n "$TOKEN" ]] && args+=(-H "Authorization: Bearer ${TOKEN}")
     [[ -n "$data" ]] && args+=(-H "Content-Type: application/json" --data "$data")
-    out="$("$CURL" "${args[@]}" -w $'\n%{http_code}' "${URL}${path}" 2>/dev/null)" || {
+    # printf is a builtin: the token is never any process's argument.
+    out="$(_curl_config | "$CURL" -K - "${args[@]}" -w $'\n%{http_code}' "${URL}${path}" 2>/dev/null)" || {
         API_BODY=""; API_CODE="000"; return 1; }
     API_CODE="${out##*$'\n'}"
     API_BODY="${out%$'\n'*}"
@@ -256,7 +275,7 @@ _need_api() {
     command -v "$CURL" &>/dev/null || error_exit "curl is required."
     command -v jq &>/dev/null || error_exit "jq is required."
     _api GET /handshake || error_exit "CoolerControl is not answering at ${URL} — is coolercontrold running? (systemctl status coolercontrold)"
-    [[ -n "$TOKEN" ]] || error_exit "no access token. Create one with write access in CoolerControl (Settings → Access Tokens), then: carbonite.sh login --token cc_…"
+    [[ -n "$TOKEN" ]] || error_exit "no access token. Create one with write access in CoolerControl (Settings → Access Tokens), then: carbonite.sh login"
     _api GET /devices || error_exit "CoolerControl refused the token: $(_api_err)"
     DEVICES="$API_BODY"
 }
@@ -520,8 +539,26 @@ _prune() {
 # -----------------------------------------------------------------------------
 # Commands
 # -----------------------------------------------------------------------------
+# login takes the token, in this order, from: --token (deprecated, warned in
+# main), stdin when it is not a terminal (`printf '%s\n' "$tok" | carbonite.sh
+# login`), $CARB_TOKEN, or a hidden prompt on a terminal. Never from the file:
+# login is how the file's token is replaced.
 cmd_login() {
-    [[ -n "$TOKEN" ]] || error_exit "login needs --token TOKEN"
+    local tok=""
+    if [[ "$TOKEN_SOURCE" == flag ]]; then
+        tok="$TOKEN"
+    elif [[ ! -t 0 ]]; then
+        IFS= read -r tok || true
+    fi
+    if [[ -z "$tok" && -n "${CARB_TOKEN:-}" ]]; then
+        tok="$CARB_TOKEN"
+    elif [[ -z "$tok" && -t 0 ]]; then
+        read -r -s -p "CoolerControl access token (with write access): " tok; echo >&2
+    fi
+    tok="${tok%$'\r'}"
+    [[ -n "$tok" ]] || error_exit "login reads the token from stdin: printf '%s\n' cc_… | carbonite.sh login (or run it on a terminal and paste it)"
+    _valid_token "$tok" || error_exit "that token has spaces or control characters — paste just the token"
+    TOKEN="$tok"
     _api GET /handshake || error_exit "CoolerControl is not answering at ${URL}"
     _api GET /devices || error_exit "CoolerControl refused that token: $(_api_err)"
     FILE_TOKEN="$TOKEN"
@@ -834,7 +871,13 @@ main() {
 
     _read_conf
     [[ -n "$url_flag" ]] && URL="${url_flag%/}"
-    if [[ -n "$token_flag" ]]; then TOKEN="$token_flag"; TOKEN_SOURCE="flag"; fi
+    if [[ -n "$token_flag" ]]; then
+        # Kept so existing scripts still work, but said: argv is public.
+        warn "--token puts the token on this process's command line, where 'ps' shows it to every user. Pipe it to 'carbonite.sh login' instead, or set \$CARB_TOKEN."
+        TOKEN="$token_flag"; TOKEN_SOURCE="flag"
+    fi
+    # A newline in it would be a second header in curl's config.
+    [[ -z "$TOKEN" ]] || _valid_token "$TOKEN" || error_exit "the access token (${TOKEN_SOURCE}) has spaces or control characters"
 
     case "$cmd" in
         login)        cmd_login ;;

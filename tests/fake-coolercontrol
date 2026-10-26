@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # A curl stand-in that is a tiny, stateful CoolerControl. Pointed at by
 # CARB_CURL. State lives as JSON files in $FAKE_CC; every request is appended
-# to $FAKE_CC/calls as "METHOD PATH BODY".
+# to $FAKE_CC/calls as "METHOD PATH BODY", and its argv to $FAKE_CC/argv.
+#
+# The token arrives the way the engine must send it: in a curl config on stdin
+# (-K -), never on argv, where `ps` shows it to every user. An Authorization
+# header given with -H is ignored, so an engine that goes back to it is
+# refused (401) everywhere, and the argv log lets a test say why.
 #
 # Only the routes the engine uses exist, with the shapes coolercontrold 4.3.1
 # returns. A wrong route answers 404, as the real daemon does, so a typo in the
@@ -9,12 +14,25 @@
 set -uo pipefail
 
 S="${FAKE_CC:?FAKE_CC not set}"
+printf '%s\n' "$*" >> "$S/argv"
 method=GET data="" url="" auth=""
+# curl's config syntax, the part the engine uses: header = "...", with \\ and
+# \" unescaped inside the quotes.
+read_config() {
+    local line v
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ "$line" =~ ^[[:space:]]*header[[:space:]]*=[[:space:]]*\"(.*)\"[[:space:]]*$ ]] || continue
+        v="${BASH_REMATCH[1]}"
+        v="$(sed -e 's/\\\(.\)/\1/g' <<<"$v")"
+        [[ "$v" == "Authorization: Bearer "* ]] && auth="${v#Authorization: Bearer }"
+    done
+}
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -X)     method="$2"; shift 2 ;;
         --data) data="$2"; shift 2 ;;
-        -H)     [[ "$2" == Authorization:* ]] && auth="${2#Authorization: Bearer }"; shift 2 ;;
+        -K|--config) [[ "$2" == - ]] && read_config; shift 2 ;;
+        -H)     shift 2 ;;
         -w|--max-time) shift 2 ;;
         -*)     shift ;;
         *)      url="$1"; shift ;;
