@@ -290,6 +290,33 @@ check "  and nothing was deleted"                   bash -c "! grep -q '^DELETE 
 check "  the function is kept too"                  grep -q carbonite-fn "$FAKE_CC/functions.json"
 rm -f "$FAKE_CC/fail"
 
+echo "## 19. a device whose settings cannot be read blocks pruning and deleting"
+G1="${GPU:0:8}:fan1"
+reset_cc; eng apply --channels "${F2}@45 $G1"; : > "$FAKE_CC/calls"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail"
+eng apply --channels "$G1"
+check "apply fails"                                 bash -c "(( $RC != 0 ))"
+check "  naming the unreadable device"              has "${NCT:0:8}" "$OUT"
+check "  and nothing is pruned"                     bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the fan there keeps its 45% set"           is "$(prof carbonite-m45 .uid)" '"carbonite-m45"'
+rm -f "$FAKE_CC/fail"
+eng apply --channels "$G1"
+check "once readable, apply hands the fan back"     is "$(setting "$NCT" fan2 profile_uid)" 0
+check "  and prunes its set"                        bash -c "! grep -q carbonite-m45 '$FAKE_CC/profiles.json'"
+reset_cc; eng apply --channels "${F2}@45 $G1"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail-once"
+eng apply --channels "$G1"
+check "a read that fails once is retried"           is "$RC" 0
+check "  and the fan is handed back"                is "$(setting "$NCT" fan2 profile_uid)" 0
+reset_cc; eng apply --channels "$F3"; : > "$FAKE_CC/calls"
+echo "GET /devices/${NCT}/settings" > "$FAKE_CC/fail"
+eng release --yes
+check "release fails"                               bash -c "(( $RC != 0 ))"
+check "  deleting nothing"                          bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the fan keeps its profile"                 is "$(setting "$NCT" fan3 profile_uid)" carbonite
+check "  and the function"                          grep -q carbonite-fn "$FAKE_CC/functions.json"
+rm -f "$FAKE_CC/fail"
+
 echo
 (( FAILS == 0 )) && { echo "all passed"; exit 0; }
 echo "${FAILS} failed"; exit 1

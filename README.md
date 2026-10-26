@@ -148,6 +148,10 @@ across reboots, unlike hwmon indices.
 - **`release`** sets the channels to CoolerControl's Default profile, which
   restores the board's own `pwm_enable` mode, then deletes the objects. It
   stops before deleting if any channel could not be handed back.
+- **A device whose fan settings cannot be read** (two tries) is named in a
+  warning, and while it is unreadable `apply` does not prune and `release`
+  does not delete: a fan there may still be on a carbonite profile. Both exit
+  non-zero; run them again once CoolerControl answers for that device.
 - **Other pwm writers** (`fancontrol`, `fan2go`, `thermal-exhaust-port`,
   `nbfc`) fight CoolerControl. `conflicts`, `apply` and `status` say so.
 - Written against coolercontrold **4.3.1**: routes, JSON shapes and validation

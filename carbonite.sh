@@ -343,12 +343,21 @@ _pins_set() { _pins_drop "$1"; PINS="$(echo "$PINS $1@$2" | xargs)"; }
 
 # What controls each channel, from CoolerControl's own settings (so it reflects
 # the GUI too): CONTROL[id] = curve | curve:N | pin:N | fixed:N.
+#
+# A device whose settings cannot be read (tried twice) is listed in UNREAD and
+# warned about: its channels may be on a carbonite profile nobody here knows
+# of, so apply must not prune and release must not delete while it is set —
+# that would pull a profile from under a fan never handed back.
 declare -A CONTROL=()
+UNREAD=""
 _load_managed() {
-    CONTROL=()
+    CONTROL=(); UNREAD=""
     local duid ch kind val id
     while IFS= read -r duid; do
-        _api GET "/devices/${duid}/settings" || continue
+        if ! _api GET "/devices/${duid}/settings" && ! _api GET "/devices/${duid}/settings"; then
+            warn "could not read the fan settings of device ${duid:0:8}: $(_api_err)"
+            UNREAD+="${duid:0:8} "; continue
+        fi
         while IFS=$'\t' read -r ch kind val; do
             [[ -n "$ch" ]] || continue
             id="${duid:0:8}:${ch// /_}"
@@ -717,6 +726,10 @@ cmd_apply() {
             error "${id}: could not hand back: $(_api_err)"; fails=$((fails + 1))
         fi
     done
+    if [[ -n "$UNREAD" ]]; then
+        error "not pruning: the settings of ${UNREAD% } could not be read, so a fan there may still use a carbonite profile. Run apply again once CoolerControl answers for it."
+        fails=$((fails + 1))
+    fi
     (( fails == 0 )) && _prune
     _warn_conflicts
     (( fails == 0 )) || exit 1
@@ -756,6 +769,7 @@ cmd_release() {
         fi
     done
     (( fails == 0 )) || error_exit "some channels still use a carbonite profile — not deleting them"
+    [[ -z "$UNREAD" ]] || error_exit "the settings of ${UNREAD% } could not be read, so a fan there may still use a carbonite profile — not deleting them. Run release again once CoolerControl answers for it."
 
     KEPT=(); _prune
     _api DELETE "/functions/${FN_UID}" &>/dev/null
