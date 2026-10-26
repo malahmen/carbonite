@@ -46,6 +46,20 @@ reply() { printf '%s\n%s' "$2" "$1"; exit 0; }
 
 [[ "$path" == /handshake ]] && reply 200 '{"shake":true}'
 [[ "$auth" == "$(cat "$S/token")" ]] || reply 401 '{"error":"Invalid Credentials"}'
+# Injected faults, for the failure paths: each line of $S/fail is an ERE
+# matched against "METHOD PATH" (the path as sent, still encoded), and a match
+# answers 500. $S/fail-once is the same, but is removed after its first match.
+fails_on() {
+    local re
+    while IFS= read -r re; do
+        [[ -n "$re" && "$method $path" =~ $re ]] && return 0
+    done < "$1"
+    return 1
+}
+if [[ -f "$S/fail" ]] && fails_on "$S/fail"; then reply 500 '{"error":"injected failure"}'; fi
+if [[ -f "$S/fail-once" ]] && fails_on "$S/fail-once"; then
+    rm -f "$S/fail-once"; reply 500 '{"error":"injected failure (once)"}'
+fi
 # A read-only token reads but may not write, as with the real daemon.
 if [[ -f "$S/readonly" && "$method" != GET && "$path" != /status ]]; then
     reply 403 '{"error":"This token does not have write access."}'

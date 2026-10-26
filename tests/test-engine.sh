@@ -266,6 +266,30 @@ CARB_TOKEN="" eng release --yes
 check "  and the saved token is used"               is "$RC" 0
 check "  never on curl's argv"                      bash -c '! grep -qF -- "$1" "$2"' _ "$SECRET" "$FAKE_CC/argv"
 
+echo "## 18. a failed step stops everything after it"
+F1="${NCT:0:8}:fan1" F2="${NCT:0:8}:fan2" F3="${NCT:0:8}:fan3"
+reset_cc; echo 'PUT /devices/[^/]+/settings/fan1/manual' > "$FAKE_CC/fail"
+eng apply --pin "${F1}@100" --channels "$F3"
+check "a failed --pin fails apply"                  bash -c "(( $RC != 0 ))"
+check "  saying the curve was not touched"          has "curve was not touched" "$OUT"
+check "  and nothing was written after the pin"     bash -c "! grep -qE '^(POST|PUT) /(profiles|functions)|/fan3/' '$FAKE_CC/calls'"
+check "  the fan the curve would take is untouched" is "$(setting "$NCT" fan3 profile_uid)" ""
+reset_cc; eng apply --channels "${F2}@45 $F3"; : > "$FAKE_CC/calls"
+echo 'PUT /devices/[^/]+/settings/fan2/profile' > "$FAKE_CC/fail"
+eng apply --channels "$F3"
+check "a failed hand-back fails apply"              bash -c "(( $RC != 0 ))"
+check "  and nothing is pruned"                     bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the 45% set its fan still uses is kept"    is "$(prof carbonite-m45 .uid)" '"carbonite-m45"'
+check "  and that fan is still on it"               is "$(setting "$NCT" fan2 profile_uid)" carbonite-m45
+reset_cc; eng apply --channels "$F3"; : > "$FAKE_CC/calls"
+echo 'PUT /devices/[^/]+/settings/fan3/profile' > "$FAKE_CC/fail"
+eng release --yes
+check "a failed hand-back fails release"            bash -c "(( $RC != 0 ))"
+check "  saying it is not deleting"                 has "not deleting" "$OUT"
+check "  and nothing was deleted"                   bash -c "! grep -q '^DELETE ' '$FAKE_CC/calls'"
+check "  the function is kept too"                  grep -q carbonite-fn "$FAKE_CC/functions.json"
+rm -f "$FAKE_CC/fail"
+
 echo
 (( FAILS == 0 )) && { echo "all passed"; exit 0; }
 echo "${FAILS} failed"; exit 1

@@ -163,7 +163,9 @@ No daemon, no token, no hardware. `tests/fake-coolercontrol` stands in for
 `curl` (`$CARB_CURL`) as a small, stateful CoolerControl with 4.3.1's routes and
 shapes, decoding the path as the daemon does. It takes the token only from a
 curl config on stdin and logs every argv, so a test fails if the token ever
-reaches a command line. It refuses to delete a profile
+reaches a command line. A line in `$FAKE_CC/fail` (an ERE on
+"METHOD PATH") makes matching calls answer 500, so the failure paths (a pin,
+a hand-back, a settings read) are tested, not only the happy ones. It refuses to delete a profile
 that is still in use, so an engine that deletes before it reassigns fails a
 test. CI (`.github/workflows/ci.yml`) runs shellcheck and the suite on every
 push and pull request. `tests/fixture.sh` is its starting state, shared with scomp-link's
