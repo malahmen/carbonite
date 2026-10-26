@@ -317,6 +317,24 @@ check "  the fan keeps its profile"                 is "$(setting "$NCT" fan3 pr
 check "  and the function"                          grep -q carbonite-fn "$FAKE_CC/functions.json"
 rm -f "$FAKE_CC/fail"
 
+echo "## 20. a weak pin or curve is applied, with a warning"
+reset_cc; eng apply --pin "${F1}@30" --channels "$F3"
+check "a pin below 50% is applied"                  is "$(setting "$NCT" fan1 speed_fixed)" 30
+check "  with a warning about pumps"                has "most AIO pumps want 50%" "$OUT"
+eng pin "${F1}@20"
+check "pin warns too"                               has "most AIO pumps want 50%" "$OUT"
+eng pin "${F1}@50"
+check "a pin at 50% warns nothing"                  bash -c "! grep -q 'pumps want' <<<\"\$1\"" _ "$OUT"
+eng simulate --curve "30:25 90:30" 50
+check "simulate warns on a curve topping out at 30%" has "tops out at 30%" "$OUT"
+reset_cc; eng apply --curve "30:25 90:30" --channels "$F3"
+check "apply applies it"                            is "$RC" 0
+check "  with the warning"                          has "tops out at 30%" "$OUT"
+eng set-curve "30:25 90:69"
+check "set-curve warns below 70%"                   has "tops out at 69%" "$OUT"
+eng set-curve "30:25 90:70"
+check "a curve reaching 70% warns nothing"          bash -c "! grep -q 'tops out' <<<\"\$1\"" _ "$OUT"
+
 echo
 (( FAILS == 0 )) && { echo "all passed"; exit 0; }
 echo "${FAILS} failed"; exit 1

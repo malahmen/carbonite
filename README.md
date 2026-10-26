@@ -123,6 +123,11 @@ refuse one while any fan on it has no floor, naming those fans; give each a
 floor (`ID@N`), which lifts its 0% to N%, or pass `--allow-stop` if they may
 really stop. `simulate` only warns.
 
+**Weak settings are warned about, not refused.** A curve whose hottest duty is
+under 70% (`30:25 90:30`) never speeds the fans up under a sustained load, and
+a pin under 50% is too slow for most AIO pumps. `simulate`, `apply`,
+`set-curve` and `pin` say so and carry on, since either can be meant.
+
 ## Ids
 
 `<first 8 of the device uid>:<name>`, with spaces as `_`, for example

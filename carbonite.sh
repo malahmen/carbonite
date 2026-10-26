@@ -79,6 +79,13 @@ CURVE=""; SENSORS=""; CHANNELS=""; PIN=""; HYST=""; DELAY=""
 YES=0
 ALLOW_STOP=0
 
+# Below these a setting is allowed but said: a pump under ~50% can starve the
+# CPU block, and a curve that tops out low never speeds the fans up under a
+# sustained load. Warnings, not refusals — a quiet pump or a capped curve can
+# be what is meant.
+WEAK_PIN=50
+WEAK_TOP=70
+
 PREFIX="carbonite"
 FN_UID="${PREFIX}-fn"
 TOP_UID="${PREFIX}"
@@ -212,6 +219,13 @@ _refuse_stopping_fans() {
     for s in $1; do [[ -n "$(_spec_n "$s")" ]] || bare+="$(_spec_id "$s") "; done
     [[ -n "$bare" ]] || return 0
     error_exit "the curve is at 0% up to ${t}C, which STOPS ${bare% } there. Give each a floor (ID@N, e.g. ID@20), or pass --allow-stop if they may stop."
+}
+
+# _warn_weak_curve — the parsed curve's hottest duty is under WEAK_TOP.
+_warn_weak_curve() {
+    local n=${#CD[@]}
+    (( CD[n-1] < WEAK_TOP )) || return 0
+    warn "this curve tops out at ${CD[n-1]}% (from ${CT[n-1]}C up): under a sustained load the fans on it never go faster. Most curves end at 100%."
 }
 
 # duty_at T — CoolerControl's interpolate_profile: clamp at the ends, linear
@@ -609,6 +623,7 @@ cmd_simulate() {
     parse_curve "${CURVE:-$DEFAULT_CURVE}" || exit 1
     local stop; stop="$(_stop_below)"
     [[ -z "$stop" ]] || warn "this curve is at 0% up to ${stop}C: fans on it stop there unless given a floor (ID@N); apply refuses it without one, or --allow-stop"
+    _warn_weak_curve
     (( $# )) || set -- 30 40 50 60 70 80 90
     local t
     for t in "$@"; do
@@ -622,6 +637,7 @@ _do_pins() {
     local s id n fails=0
     for s in $1; do
         id="$(_spec_id "$s")"; n="$(_spec_n "$s")"
+        (( 10#$n >= WEAK_PIN )) || warn "${id} pinned at ${n}%: if it is a pump, most AIO pumps want ${WEAK_PIN}% or more (many run at 100%); a slow pump can starve the CPU block."
         if _channel_put "$id" manual "{\"speed_fixed\":${n}}"; then
             _pins_set "$id" "$n"; success "${id} pinned at ${n}%"
         else
@@ -667,6 +683,7 @@ cmd_apply() {
     _need_api; _load_status
     local curve="${CURVE:-$DEFAULT_CURVE}" sensors="${SENSORS:-}" channels="${CHANNELS:-}" pins="${PIN:-}"
     parse_curve "$curve" || exit 1
+    _warn_weak_curve
     [[ -n "$sensors" ]]  || sensors="$(_default_sensors)"
     [[ -n "$sensors" ]]  || error_exit "no CPU/GPU sensor found to default to — pass --sensors (see 'sensors')"
     # No default: a pump's header cannot be told from its label, and a pump on
@@ -740,6 +757,7 @@ cmd_set_curve() {
     [[ -n "$curve" ]] || error_exit "set-curve needs POINTS"
     # Validated before anything is touched.
     parse_curve "$curve" || exit 1
+    _warn_weak_curve
     _need_api; _load_status; _load_profiles; _load_applied; _load_managed
     (( APPLIED )) || error_exit "nothing applied yet — use 'apply' first"
     _refuse_stopping_fans "$(_curve_specs)"
